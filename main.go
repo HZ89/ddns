@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -109,14 +110,15 @@ func (conn *Connection) SendCommands(cmds ...string) ([]byte, error) {
 
 func main() {
 	var (
-		method string
-		address  string
+		method    string
+		address   string
 		sshUser   string
 		sshPasswd string
 		secretID  string
 		secretKey string
-		domain string
-		record string
+		domain    string
+		record    string
+		iface     string
 	)
 	flag.StringVar(&method, "method", "ssh", "use which method connect to remote. ssh or http is allowed.")
 	flag.StringVar(&address, "address", "", "remote address")
@@ -126,12 +128,13 @@ func main() {
 	flag.StringVar(&secretKey, "secretKey", "", "secret key of tencent cloud dnspod")
 	flag.StringVar(&domain, "domain", "b1uepi11.xyz", "domain name to be synced")
 	flag.StringVar(&record, "record", "@", "record of the domain to be synced")
+	flag.StringVar(&iface, "iface", "pppoe-wan", "the name of network device")
 	flag.Parse()
-	if method != "ssh" || method != "http" {
+	if method != "ssh" && method != "http" {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	if method == "ssh"&& (len(sshUser) == 0 || len(sshPasswd) == 0) {
+	if method == "ssh" && (len(sshUser) == 0 || len(sshPasswd) == 0) {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -164,13 +167,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("ssh to router failed: %v", err)
 	}
-	output, err := ssh.SendCommands(`ip a | grep pppoe-wan | grep inet | cut -f6 -d' '`)
+	output, err := ssh.SendCommands(fmt.Sprintf("ip a | grep %s | grep inet | cut -f6 -d' '", iface))
 	if err != nil {
 		log.Fatalf("exec command on router failed: %v", err)
 	}
-	ip := net.ParseIP(strings.TrimSpace(string(output)))
-	if ip == nil {
-		log.Fatalf("parse ip failed")
+	ip, _, err := net.ParseCIDR(strings.TrimSpace(string(output)))
+	if err != nil {
+		log.Fatalf("parse cidr failed: %v", err)
 	}
 	if ip.String() != *rli.Value {
 		log.Printf("sync ssh public to %s.%s", record, domain)
