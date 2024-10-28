@@ -1,197 +1,270 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
-	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
-	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/regions"
-	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
+	"github.com/cloudflare/cloudflare-go"
 	"golang.org/x/crypto/ssh"
 )
 
+// Connection represents an SSH connection to a remote host.
 type Connection struct {
-	*ssh.Client
+	client   *ssh.Client
 	password string
 }
 
+// Connect establishes an SSH connection to the specified address using the provided username and password.
 func Connect(addr, user, password string) (*Connection, error) {
 	sshConfig := &ssh.ClientConfig{
-		User: user,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(password),
-		},
-		HostKeyCallback: ssh.HostKeyCallback(func(hostname string, remote net.Addr, key ssh.PublicKey) error { return nil }),
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Consider using a proper host key callback in production
+		Timeout:         10 * time.Second,
 	}
 
-	conn, err := ssh.Dial("tcp", addr, sshConfig)
+	client, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to SSH server: %v", err)
 	}
 
-	return &Connection{conn, password}, nil
-
+	return &Connection{client: client, password: password}, nil
 }
 
-func (conn *Connection) SendCommands(cmds ...string) ([]byte, error) {
-	session, err := conn.NewSession()
+// RunCommand executes a command on the remote host and returns its output.
+func (conn *Connection) RunCommand(cmd string) (string, error) {
+	session, err := conn.client.NewSession()
 	if err != nil {
-		log.Fatal(err)
+		return "", fmt.Errorf("failed to create SSH session: %v", err)
 	}
 	defer session.Close()
 
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          0,     // disable echoing
-		ssh.TTY_OP_ISPEED: 14400, // input speed = 14.4kbaud
-		ssh.TTY_OP_OSPEED: 14400, // output speed = 14.4kbaud
-	}
-
-	err = session.RequestPty("xterm", 80, 40, modes)
+	output, err := session.CombinedOutput(cmd)
 	if err != nil {
-		return []byte{}, err
+		return "", fmt.Errorf("command execution failed: %v, output: %s", err, string(output))
 	}
 
-	in, err := session.StdinPipe()
-	if err != nil {
-		log.Fatal(err)
-	}
+	return strings.TrimSpace(string(output)), nil
+}
 
-	out, err := session.StdoutPipe()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var output []byte
-
-	go func(in io.WriteCloser, out io.Reader, output *[]byte) {
-		var (
-			line string
-			r    = bufio.NewReader(out)
-		)
-		for {
-			b, err := r.ReadByte()
-			if err != nil {
-				break
-			}
-
-			*output = append(*output, b)
-
-			if b == byte('\n') {
-				line = ""
-				continue
-			}
-
-			line += string(b)
-
-			if strings.HasSuffix(line, "password: ") {
-				_, err = in.Write([]byte(conn.password + "\n"))
-				if err != nil {
-					break
-				}
-			}
-		}
-	}(in, out, &output)
-
-	cmd := strings.Join(cmds, "; ")
-	_, err = session.Output(cmd)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	return output, nil
+// isGlobalUnicast checks if an IP address is a global unicast address.
+func isGlobalUnicast(ip net.IP) bool {
+	return ip.IsGlobalUnicast() &&
+		!ip.IsLinkLocalUnicast() &&
+		!ip.IsInterfaceLocalMulticast() &&
+		!ip.IsLinkLocalMulticast() &&
+		!ip.IsMulticast() &&
+		!ip.IsLoopback() &&
+		!ip.IsUnspecified()
 }
 
 func main() {
 	var (
-		method    string
-		address   string
-		sshUser   string
-		sshPasswd string
-		secretID  string
-		secretKey string
-		domain    string
-		record    string
-		iface     string
+		method      string
+		address     string
+		sshUser     string
+		sshPasswd   string
+		domain      string
+		record      string
+		ifaceV4Name string
+		ifcaeV6Name string
+		apiToken    string
+		zoneID      string
+		ipAddrV4    string
+		ipAddrV6    string
+		dnsRecordV4 *cloudflare.DNSRecord
+		dnsRecordV6 *cloudflare.DNSRecord
 	)
-	flag.StringVar(&method, "method", "ssh", "use which method connect to remote. ssh or http is allowed.")
-	flag.StringVar(&address, "address", "", "remote address")
-	flag.StringVar(&sshUser, "user", "root", "user name of router ssh")
-	flag.StringVar(&sshPasswd, "passwd", "", "password of the user")
-	flag.StringVar(&secretID, "secretID", "", "secret id of tencent cloud dnspod")
-	flag.StringVar(&secretKey, "secretKey", "", "secret key of tencent cloud dnspod")
-	flag.StringVar(&domain, "domain", "b1uepi11.xyz", "domain name to be synced")
-	flag.StringVar(&record, "record", "@", "record of the domain to be synced")
-	flag.StringVar(&iface, "iface", "pppoe-wan", "the name of network device")
+
+	// Command-line flags
+	flag.StringVar(&method, "method", "ssh", "Connection method: 'ssh' or 'http'")
+	flag.StringVar(&address, "address", "", "Remote address (e.g., '192.168.1.1:22')")
+	flag.StringVar(&sshUser, "user", "root", "SSH username")
+	flag.StringVar(&sshPasswd, "passwd", "", "SSH password")
+	flag.StringVar(&domain, "domain", "example.com", "Domain name to update")
+	flag.StringVar(&record, "record", "@", "DNS record to update")
+	flag.StringVar(&ifaceV4Name, "ifaceV4", "eth0", "Network interface name for ipv4 address on remote server")
+	flag.StringVar(&ifcaeV6Name, "ifaceV6", ifaceV4Name, "Network infterface name for ipv6 address on local server")
+	flag.StringVar(&apiToken, "api-token", os.Getenv("CLOUDFLARE_API_TOKEN"), "Cloudflare API token")
 	flag.Parse()
+
+	// Validate required inputs
+	if apiToken == "" {
+		log.Fatal("Cloudflare API token is required. Set it via the '-api-token' flag or 'CLOUDFLARE_API_TOKEN' environment variable.")
+	}
+
 	if method != "ssh" && method != "http" {
-		flag.PrintDefaults()
-		os.Exit(1)
+		log.Fatalf("Invalid method '%s'. Only 'ssh' and 'http' are supported.", method)
 	}
-	if method == "ssh" && (len(sshUser) == 0 || len(sshPasswd) == 0) {
-		flag.PrintDefaults()
-		os.Exit(1)
+
+	if method == "ssh" && (sshUser == "" || sshPasswd == "" || address == "") {
+		log.Fatal("SSH method requires '-address', '-user', and '-passwd' parameters.")
 	}
-	if len(secretID) == 0 || len(secretKey) == 0 {
-		flag.PrintDefaults()
-		os.Exit(1)
-	}
-	credential := common.NewCredential(secretID, secretKey)
-	client, err := dnspod.NewClient(credential, regions.Beijing, profile.NewClientProfile())
+
+	// Initialize Cloudflare API client
+	api, err := cloudflare.NewWithAPIToken(apiToken)
 	if err != nil {
-		log.Fatalf("create tencent cloud dnspod client failed: %v", err)
+		log.Fatalf("Failed to create Cloudflare API client: %v", err)
 	}
-	req := dnspod.NewDescribeRecordListRequest()
-	req.Domain = &domain
-	req.RecordType = common.StringPtr("A")
-	resp, err := client.DescribeRecordList(req)
+
+	ctx := context.Background()
+
+	// Retrieve the zone ID for the specified domain
+	zones, err := api.ListZones(ctx, domain)
+	if err != nil || len(zones) == 0 {
+		log.Fatalf("Failed to retrieve zone information for domain '%s': %v", domain, err)
+	}
+	zoneID = zones[0].ID
+
+	// Retrieve DNS records for the domain
+	dnsRecords, _, err := api.ListDNSRecords(ctx, cloudflare.ZoneIdentifier(zoneID), cloudflare.ListDNSRecordsParams{Name: domain})
 	if err != nil {
-		log.Fatalf("describe record list failed: %v", err)
+		log.Fatalf("Failed to list DNS records: %v", err)
 	}
-	var rli *dnspod.RecordListItem
-	for _, rl := range resp.Response.RecordList {
-		if *rl.Name == record {
-			rli = rl
+
+	// Find existing A and AAAA records
+	for _, record := range dnsRecords {
+		if record.Name == domain {
+			switch record.Type {
+			case "A":
+				dnsRecordV4 = &record
+			case "AAAA":
+				dnsRecordV6 = &record
+			}
 		}
 	}
-	if rli == nil {
-		log.Printf("can not found record: %v", record)
-	}
-	ssh, err := Connect(address, sshUser, sshPasswd)
-	if err != nil {
-		log.Fatalf("ssh to router failed: %v", err)
-	}
-	output, err := ssh.SendCommands(fmt.Sprintf("ip a | grep %s | grep inet | cut -f6 -d' '", iface))
-	if err != nil {
-		log.Fatalf("exec command on router failed: %v", err)
-	}
-	ip, _, err := net.ParseCIDR(strings.TrimSpace(string(output)))
-	if err != nil {
-		log.Fatalf("parse cidr failed: %v", err)
-	}
-	if ip.String() != *rli.Value {
-		log.Printf("sync ssh public to %s.%s", record, domain)
-		req := dnspod.NewModifyRecordRequest()
-		req.RecordId = rli.RecordId
-		req.Domain = &domain
-		req.RecordType = rli.Type
-		req.RecordLine = rli.Line
-		req.RecordLineId = rli.LineId
-		req.Value = common.StringPtr(ip.String())
-		req.SubDomain = &record
-		req.TTL = common.Uint64Ptr(60)
-		req.Status = common.StringPtr("ENABLE")
-		if _, err := client.ModifyRecord(req); err != nil {
-			log.Fatalf("modify record %s.%s failed: %v", record, domain, err)
+
+	// Obtain the public IPv4 address
+	switch method {
+	case "ssh":
+		conn, err := Connect(address, sshUser, sshPasswd)
+		if err != nil {
+			log.Fatalf("SSH connection failed: %v", err)
 		}
-		log.Printf("set %s.%s dns %s record to %s", record, domain, *rli.Type, ip.String())
-		return
+		defer conn.client.Close()
+
+		// Run command to get the public IP address
+		cmd := fmt.Sprintf("ip -4 -o addr show dev %s | awk '{print $4}' | cut -d\"/\" -f1", ifaceV4Name)
+		ipAddrV4, err = conn.RunCommand(cmd)
+		if err != nil || ipAddrV4 == "" {
+			log.Fatalf("Failed to retrieve IPv4 address via SSH: %v", err)
+		}
+	case "http":
+		// Implement HTTP method if needed
+		log.Fatal("HTTP method is not implemented yet.")
 	}
-	log.Println("nothing changed")
+
+	// Update A record if needed
+	if dnsRecordV4 == nil || dnsRecordV4.Content != ipAddrV4 {
+		recordType := "A"
+		recordContent := ipAddrV4
+		if dnsRecordV4 == nil {
+			// Create new A record
+			newRecord := cloudflare.CreateDNSRecordParams{
+				Type:    recordType,
+				Name:    record,
+				Content: recordContent,
+				TTL:     120,
+			}
+			_, err := api.CreateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), newRecord)
+			if err != nil {
+				log.Fatalf("Failed to create A record: %v", err)
+			}
+			log.Printf("Created new A record: %s -> %s", domain, recordContent)
+		} else {
+			// Update existing A record
+			updateRecord := cloudflare.UpdateDNSRecordParams{
+				ID:      dnsRecordV4.ID,
+				Type:    dnsRecordV4.Type,
+				Name:    dnsRecordV4.Name,
+				Content: recordContent,
+				TTL:     dnsRecordV4.TTL,
+			}
+			_, err := api.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), updateRecord)
+			if err != nil {
+				log.Fatalf("Failed to update A record: %v", err)
+			}
+			log.Printf("Updated A record: %s -> %s", domain, recordContent)
+		}
+	}
+
+	// Obtain the public IPv6 address from the local interface
+	ipAddrV6, err = getLocalIPv6Address(ifcaeV6Name)
+	if err != nil {
+		log.Fatalf("Failed to retrieve IPv6 address: %v", err)
+	}
+
+	// Update AAAA record if needed
+	if dnsRecordV6 == nil || dnsRecordV6.Content != ipAddrV6 {
+		recordType := "AAAA"
+		recordContent := ipAddrV6
+		if dnsRecordV6 == nil {
+			// Create new AAAA record
+			newRecord := cloudflare.CreateDNSRecordParams{
+				Type:    recordType,
+				Name:    record,
+				Content: recordContent,
+				TTL:     120,
+			}
+			_, err := api.CreateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), newRecord)
+			if err != nil {
+				log.Fatalf("Failed to create AAAA record: %v", err)
+			}
+			log.Printf("Created new AAAA record: %s -> %s", domain, recordContent)
+		} else {
+			// Update existing AAAA record
+			updateRecord := cloudflare.UpdateDNSRecordParams{
+				ID:      dnsRecordV6.ID,
+				Type:    dnsRecordV6.Type,
+				Name:    dnsRecordV6.Name,
+				Content: recordContent,
+				TTL:     dnsRecordV6.TTL,
+			}
+			_, err := api.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), updateRecord)
+			if err != nil {
+				log.Fatalf("Failed to update AAAA record: %v", err)
+			}
+			log.Printf("Updated AAAA record: %s -> %s", domain, recordContent)
+		}
+	}
+
+	log.Println("DNS records updated successfully.")
+}
+
+// getLocalIPv6Address retrieves the first global unicast IPv6 address with a prefix length of 128 from the specified network interface.
+func getLocalIPv6Address(interfaceName string) (string, error) {
+	iface, err := net.InterfaceByName(interfaceName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get interface '%s': %v", interfaceName, err)
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", fmt.Errorf("failed to get addresses for interface '%s': %v", interfaceName, err)
+	}
+
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP
+		if ip == nil || ip.To4() != nil {
+			continue // Skip IPv4 addresses
+		}
+		if isGlobalUnicast(ip) {
+			prefixSize, _ := ipNet.Mask.Size()
+			if prefixSize == 128 {
+				return ip.String(), nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no global unicast IPv6 address with prefix length 128 found on interface '%s'", interfaceName)
 }
